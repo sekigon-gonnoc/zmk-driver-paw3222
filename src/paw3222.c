@@ -359,6 +359,12 @@ static int paw32xx_configure(const struct device *dev) {
 
     paw32xx_force_awake(dev, cfg->force_awake);
 
+    // Dummy reads to clear any residual data
+    paw32xx_read_reg(dev, PAW32XX_MOTION, &val);
+    paw32xx_read_reg(dev, PAW32XX_DELTA_X, &val);
+    paw32xx_read_reg(dev, PAW32XX_DELTA_Y, &val);
+    paw32xx_read_reg(dev, PAW32XX_DELTA_XY_HI, &val);
+
     return 0;
 }
 
