@@ -82,7 +82,8 @@ struct paw32xx_data {
     struct k_timer motion_timer; // Add timer for delayed motion checking
 };
 
-static inline int32_t sign_extend(uint32_t value, uint8_t index) {
+// Define a custom sign_extend function to avoid conflict with Zephyr's implementation
+static inline int32_t _sign_extend(uint32_t value, uint8_t index) {
     __ASSERT_NO_MSG(index <= 31);
 
     uint8_t shift = 31 - index;
@@ -196,8 +197,8 @@ static int paw32xx_read_xy(const struct device *dev, int16_t *x, int16_t *y) {
     *x = rx_data[1];
     *y = rx_data[3];
 
-    *x = sign_extend(*x, PAW32XX_DATA_SIZE_BITS - 1);
-    *y = sign_extend(*y, PAW32XX_DATA_SIZE_BITS - 1);
+    *x = _sign_extend(*x, PAW32XX_DATA_SIZE_BITS - 1);
+    *y = _sign_extend(*y, PAW32XX_DATA_SIZE_BITS - 1);
 
     return 0;
 }
