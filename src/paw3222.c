@@ -82,6 +82,29 @@ struct paw32xx_data {
     struct k_timer motion_timer; // Add timer for delayed motion checking
 };
 
+static int paw32xx_force_cs(const struct device *dev, bool force_low) {
+    const struct paw32xx_config *cfg = dev->config;
+    const struct gpio_dt_spec *cs = NULL;
+    int ret;
+
+    if (cfg->spi.config.cs.gpio.port != NULL) {
+        cs = &cfg->spi.config.cs.gpio;
+    }
+
+    if (cs == NULL || cs->port == NULL || !device_is_ready(cs->port)) {
+        LOG_ERR("CS GPIO not defined or not ready");
+        return ENODEV;
+    }
+
+    ret = gpio_pin_set_dt(cs, force_low ? 1 : 0);
+    if (ret < 0) {
+        LOG_ERR("Failed to drive CS pin: %d", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
 // Define a custom sign_extend function to avoid conflict with Zephyr's implementation
 static inline int32_t _sign_extend(uint32_t value, uint8_t index) {
     __ASSERT_NO_MSG(index <= 31);
@@ -339,6 +362,22 @@ static int paw32xx_configure(const struct device *dev) {
             if (retry_count == 0) {
                 return -ENODEV; // Device not ready after retries
             }
+#if DT_INST_NODE_HAS_PROP(0, power_gpios)
+            // reboot
+            ret = paw32xx_force_cs(dev, true);
+            if (ret < 0) {
+                return ret;
+            }
+
+            gpio_pin_set_dt(&cfg->power_gpio, 0);
+            k_sleep(K_MSEC(50)); // Wait before retrying
+            gpio_pin_set_dt(&cfg->power_gpio, 1);
+
+            ret = paw32xx_force_cs(dev, false);
+            if (ret < 0) {
+                return ret;
+            }
+#endif
             k_sleep(K_MSEC(100)); // Wait before retrying
             continue;
         }
@@ -388,6 +427,11 @@ static int paw32xx_init(const struct device *dev) {
 #if DT_INST_NODE_HAS_PROP(0, power_gpios)
     // Initialize power GPIO if defined
     if (gpio_is_ready_dt(&cfg->power_gpio)) {
+        ret = paw32xx_force_cs(dev, true);
+        if (ret != 0) {
+            return ret;
+        }
+
         // Configure as output but start with power OFF
         ret = gpio_pin_configure_dt(&cfg->power_gpio, GPIO_OUTPUT_INACTIVE);
         if (ret != 0) {
@@ -407,6 +451,14 @@ static int paw32xx_init(const struct device *dev) {
 
         // Wait for power stabilization
         k_sleep(K_MSEC(500));
+
+        ret = paw32xx_force_cs(dev, false);
+        if (ret != 0) {
+            return ret;
+        }
+
+        // Wait for power stabilization
+        k_sleep(K_MSEC(50));
     }
 #endif
 
