@@ -226,6 +226,24 @@ static int paw32xx_read_xy(const struct device *dev, int16_t *x, int16_t *y) {
     return 0;
 }
 
+static int paw32xx_interrupt_configure(const struct device *dev, gpio_flags_t flags) {
+    const struct paw32xx_config *cfg = dev->config;
+
+    if (!gpio_is_ready_dt(&cfg->irq_gpio)) {
+        return -ENODEV;
+    }
+
+    return gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, flags);
+}
+
+static int paw32xx_interrupt_enable(const struct device *dev) {
+    return paw32xx_interrupt_configure(dev, GPIO_INT_LEVEL_ACTIVE);
+}
+
+static int paw32xx_interrupt_disable(const struct device *dev) {
+    return paw32xx_interrupt_configure(dev, GPIO_INT_DISABLE);
+}
+
 static void paw32xx_motion_timer_handler(struct k_timer *timer) {
     struct paw32xx_data *data = CONTAINER_OF(timer, struct paw32xx_data, motion_timer);
     k_work_submit(&data->motion_work);
@@ -246,7 +264,7 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
 
     if ((val & MOTION_STATUS_MOTION) == 0x00) {
         // No motion detected, re-enable interrupts and wait for next interrupt
-        gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
+        paw32xx_interrupt_enable(dev);
 
         if (gpio_pin_get_dt(&cfg->irq_gpio) == 0) {
             return;
@@ -271,10 +289,12 @@ static void paw32xx_motion_handler(const struct device *gpio_dev, struct gpio_ca
                                    uint32_t pins) {
     struct paw32xx_data *data = CONTAINER_OF(cb, struct paw32xx_data, motion_cb);
     const struct device *dev = data->dev;
-    const struct paw32xx_config *cfg = dev->config;
+
+    ARG_UNUSED(gpio_dev);
+    ARG_UNUSED(pins);
 
     // Disable interrupts while timer is active
-    gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_DISABLE);
+    paw32xx_interrupt_disable(dev);
 
     // Cancel any pending timer
     k_timer_stop(&data->motion_timer);
@@ -487,7 +507,7 @@ static int paw32xx_init(const struct device *dev) {
         return ret;
     }
 
-    ret = gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
+    ret = paw32xx_interrupt_enable(dev);
     if (ret != 0) {
         LOG_ERR("Motion interrupt configuration failed: %d", ret);
         return ret;
@@ -511,7 +531,7 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
         // Disable IRQ interrupt
-        ret = gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_DISABLE);
+        ret = paw32xx_interrupt_disable(dev);
         if (ret < 0) {
             LOG_ERR("Failed to disable IRQ interrupt: %d", ret);
             return ret;
@@ -530,29 +550,9 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
             return ret;
         }
 
-#if DT_INST_NODE_HAS_PROP(0, power_gpios)
-        if (gpio_is_ready_dt(&cfg->power_gpio)) {
-            ret = gpio_pin_configure_dt(&cfg->power_gpio, GPIO_DISCONNECTED);
-            if (ret < 0) {
-                LOG_ERR("Failed to disconnect power: %d", ret);
-                return ret;
-            }
-        }
-#endif
         break;
 
     case PM_DEVICE_ACTION_RESUME:
-#if DT_INST_NODE_HAS_PROP(0, power_gpios)
-        if (gpio_is_ready_dt(&cfg->power_gpio)) {
-            ret = gpio_pin_configure_dt(&cfg->power_gpio, GPIO_OUTPUT_ACTIVE);
-            if (ret < 0) {
-                LOG_ERR("Failed to enable power: %d", ret);
-                return ret;
-            }
-            // Wait for power stabilization
-            k_sleep(K_MSEC(10));
-        }
-#endif
 
         val = 0;
         ret = paw32xx_update_reg(dev, PAW32XX_CONFIGURATION, CONFIGURATION_PD_ENH, val);
@@ -568,7 +568,7 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         }
 
         // Re-enable IRQ interrupt
-        ret = gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
+        ret = paw32xx_interrupt_enable(dev);
         if (ret < 0) {
             LOG_ERR("Failed to enable IRQ interrupt: %d", ret);
             return ret;
