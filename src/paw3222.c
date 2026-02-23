@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <zephyr/devicetree.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/spi.h>
@@ -20,6 +21,11 @@
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/device_runtime.h>
 #include <zephyr/sys/util.h>
+
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+#include <hal/nrf_gpio.h>
+#include <hal/nrf_spim.h>
+#endif
 
 #include "../include/paw3222.h"
 
@@ -80,7 +86,158 @@ struct paw32xx_data {
     struct k_work motion_work;
     struct gpio_callback motion_cb;
     struct k_timer motion_timer; // Add timer for delayed motion checking
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    NRF_SPIM_Type *spim;
+    uint32_t spim_mosi_psel;
+    uint32_t spim_miso_psel;
+    uint32_t spim_sclk_psel;
+    bool spim_mosi_psel_saved;
+    bool spim_miso_psel_saved;
+#endif
 };
+
+#define PAW32XX_NRF_PSEL_CONNECT_BIT BIT(31)
+#define PAW32XX_NRF_PSEL_PIN_MASK GENMASK(4, 0)
+#define PAW32XX_NRF_PSEL_PORT_BIT BIT(5)
+
+static NRF_SPIM_Type *paw32xx_nrf52_spim_from_bus(const struct device *dev) {
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    const struct paw32xx_config *cfg = dev->config;
+
+#if DT_NODE_HAS_STATUS(DT_NODELABEL(spi0), okay) && defined(NRF_SPIM0)
+    if (cfg->spi.bus == DEVICE_DT_GET(DT_NODELABEL(spi0))) {
+        return NRF_SPIM0;
+    }
+#endif
+#if DT_NODE_HAS_STATUS(DT_NODELABEL(spi1), okay) && defined(NRF_SPIM1)
+    if (cfg->spi.bus == DEVICE_DT_GET(DT_NODELABEL(spi1))) {
+        return NRF_SPIM1;
+    }
+#endif
+    return NULL;
+#else
+    ARG_UNUSED(dev);
+    return NULL;
+#endif
+}
+
+static void paw32xx_nrf52_spim_deactivate(struct paw32xx_data *data) {
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    if (data->spim != NULL) {
+        nrf_spim_disable(data->spim);
+    }
+#else
+    ARG_UNUSED(data);
+#endif
+}
+
+static void paw32xx_nrf52_spim_activate(struct paw32xx_data *data) {
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    if (data->spim != NULL) {
+        nrf_spim_enable(data->spim);
+    }
+#else
+    ARG_UNUSED(data);
+#endif
+}
+
+static uint32_t paw32xx_nrf52_psel_to_pin(uint32_t psel) {
+    uint32_t pin = psel & PAW32XX_NRF_PSEL_PIN_MASK;
+
+    if ((psel & PAW32XX_NRF_PSEL_PORT_BIT) != 0U) {
+        pin += 32U;
+    }
+
+    return pin;
+}
+
+static void paw32xx_sdio_init(struct paw32xx_data *data) {
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    if (data->spim == NULL) {
+        return;
+    }
+
+    data->spim_mosi_psel = data->spim->PSEL.MOSI;
+    data->spim_miso_psel = data->spim->PSEL.MISO;
+    data->spim_sclk_psel = data->spim->PSEL.SCK;
+
+    data->spim_mosi_psel_saved = ((data->spim_mosi_psel & PAW32XX_NRF_PSEL_CONNECT_BIT) == 0U);
+    data->spim_miso_psel_saved = ((data->spim_miso_psel & PAW32XX_NRF_PSEL_CONNECT_BIT) == 0U);
+
+    if (data->spim_mosi_psel_saved) {
+        nrf_gpio_cfg_default(paw32xx_nrf52_psel_to_pin(data->spim_mosi_psel));
+    }
+    if (data->spim_miso_psel_saved) {
+        nrf_gpio_cfg_default(paw32xx_nrf52_psel_to_pin(data->spim_miso_psel));
+        nrf_gpio_cfg_input(paw32xx_nrf52_psel_to_pin(data->spim_miso_psel), NRF_GPIO_PIN_PULLUP);
+    }
+#else
+    ARG_UNUSED(data);
+#endif
+}
+
+static void paw32xx_sdio_disconnect(struct paw32xx_data *data) {
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    if (data->spim == NULL) {
+        return;
+    }
+
+    if (!data->spim_mosi_psel_saved) {
+        data->spim_mosi_psel = data->spim->PSEL.MOSI;
+        data->spim_mosi_psel_saved = ((data->spim_mosi_psel & PAW32XX_NRF_PSEL_CONNECT_BIT) == 0U);
+    }
+    if (!data->spim_miso_psel_saved) {
+        data->spim_miso_psel = data->spim->PSEL.MISO;
+        data->spim_miso_psel_saved = ((data->spim_miso_psel & PAW32XX_NRF_PSEL_CONNECT_BIT) == 0U);
+    }
+
+    if (data->spim_mosi_psel_saved) {
+        nrf_gpio_cfg_default(paw32xx_nrf52_psel_to_pin(data->spim_mosi_psel));
+        data->spim->PSEL.MOSI = data->spim_mosi_psel | PAW32XX_NRF_PSEL_CONNECT_BIT;
+    }
+
+    if (data->spim_miso_psel_saved) {
+        nrf_gpio_cfg_input(paw32xx_nrf52_psel_to_pin(data->spim_miso_psel), NRF_GPIO_PIN_PULLUP);
+        data->spim->PSEL.MISO = data->spim_miso_psel | PAW32XX_NRF_PSEL_CONNECT_BIT;
+    }
+#else
+    ARG_UNUSED(data);
+#endif
+}
+
+static void paw32xx_sdio_connect(struct paw32xx_data *data) {
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    if (data->spim == NULL) {
+        return;
+    }
+
+    if (data->spim_mosi_psel_saved) {
+        nrf_gpio_cfg_output(paw32xx_nrf52_psel_to_pin(data->spim_mosi_psel));
+        data->spim->PSEL.MOSI = data->spim_mosi_psel & ~PAW32XX_NRF_PSEL_CONNECT_BIT;
+    }
+
+    if (data->spim_miso_psel_saved) {
+        nrf_gpio_cfg_input(paw32xx_nrf52_psel_to_pin(data->spim_miso_psel), NRF_GPIO_PIN_NOPULL);
+        data->spim->PSEL.MISO = data->spim_miso_psel & ~PAW32XX_NRF_PSEL_CONNECT_BIT;
+    }
+#else
+    ARG_UNUSED(data);
+#endif
+}
+
+static void paw32xx_spi_transaction_begin(const struct device *dev) {
+    struct paw32xx_data *data = dev->data;
+
+    paw32xx_sdio_connect(data);
+    paw32xx_nrf52_spim_activate(data);
+}
+
+static void paw32xx_spi_transaction_end(const struct device *dev) {
+    struct paw32xx_data *data = dev->data;
+
+    paw32xx_sdio_disconnect(data);
+    paw32xx_nrf52_spim_deactivate(data);
+}
 
 static int paw32xx_force_cs(const struct device *dev, bool force_low) {
     const struct paw32xx_config *cfg = dev->config;
@@ -142,13 +299,16 @@ static int paw32xx_read_reg(const struct device *dev, uint8_t addr, uint8_t *val
         .count = ARRAY_SIZE(rx_buf),
     };
 
+    paw32xx_spi_transaction_begin(dev);
     ret = spi_transceive_dt(&cfg->spi, &tx, &rx);
+    paw32xx_spi_transaction_end(dev);
 
     return ret;
 }
 
 static int paw32xx_write_reg(const struct device *dev, uint8_t addr, uint8_t value) {
     const struct paw32xx_config *cfg = dev->config;
+    int ret;
 
     uint8_t write_buf[] = {addr | SPI_WRITE, value};
     const struct spi_buf tx_buf = {
@@ -160,7 +320,11 @@ static int paw32xx_write_reg(const struct device *dev, uint8_t addr, uint8_t val
         .count = 1,
     };
 
-    return spi_write_dt(&cfg->spi, &tx);
+    paw32xx_spi_transaction_begin(dev);
+    ret = spi_write_dt(&cfg->spi, &tx);
+    paw32xx_spi_transaction_end(dev);
+
+    return ret;
 }
 
 static int paw32xx_update_reg(const struct device *dev, uint8_t addr, uint8_t mask, uint8_t value) {
@@ -212,7 +376,9 @@ static int paw32xx_read_xy(const struct device *dev, int16_t *x, int16_t *y) {
         .count = 1,
     };
 
+    paw32xx_spi_transaction_begin(dev);
     ret = spi_transceive_dt(&cfg->spi, &tx, &rx);
+    paw32xx_spi_transaction_end(dev);
     if (ret < 0) {
         return ret;
     }
@@ -237,7 +403,7 @@ static int paw32xx_interrupt_configure(const struct device *dev, gpio_flags_t fl
 }
 
 static int paw32xx_interrupt_enable(const struct device *dev) {
-    return paw32xx_interrupt_configure(dev, GPIO_INT_LEVEL_ACTIVE);
+    return paw32xx_interrupt_configure(dev, GPIO_INT_LEVEL_LOW);
 }
 
 static int paw32xx_interrupt_disable(const struct device *dev) {
@@ -438,6 +604,13 @@ static int paw32xx_init(const struct device *dev) {
         return -ENODEV;
     }
 
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+    data->spim = paw32xx_nrf52_spim_from_bus(dev);
+#endif
+
+    paw32xx_sdio_init(data);
+    paw32xx_sdio_disconnect(data);
+
     data->dev = dev;
 
     k_work_init(&data->motion_work, paw32xx_motion_work_handler);
@@ -550,9 +723,30 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
             return ret;
         }
 
+#if DT_INST_NODE_HAS_PROP(0, power_gpios)
+        // Power off the device
+        gpio_pin_configure_dt(&cfg->spi.config.cs.gpio, GPIO_INPUT | GPIO_PULL_DOWN);
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+        struct paw32xx_data *data = dev->data;
+        nrf_gpio_cfg_input(paw32xx_nrf52_psel_to_pin(data->spim_miso_psel), NRF_GPIO_PIN_PULLDOWN);
+        nrf_gpio_cfg_input(paw32xx_nrf52_psel_to_pin(data->spim_sclk_psel), NRF_GPIO_PIN_PULLDOWN);
+#endif
+        gpio_pin_configure_dt(&cfg->irq_gpio, GPIO_INPUT | GPIO_PULL_DOWN);
+        gpio_pin_configure_dt(&cfg->power_gpio, GPIO_INPUT | GPIO_PULL_DOWN);
+#endif
+
         break;
 
     case PM_DEVICE_ACTION_RESUME:
+
+#if DT_INST_NODE_HAS_PROP(0, power_gpios)
+        gpio_pin_configure_dt(&cfg->power_gpio, GPIO_OUTPUT_INACTIVE);
+        k_sleep(K_MSEC(10));
+        gpio_pin_set_dt(&cfg->power_gpio, 1);
+        k_sleep(K_MSEC(500));
+
+        paw32xx_configure(dev);
+#endif
 
         val = 0;
         ret = paw32xx_update_reg(dev, PAW32XX_CONFIGURATION, CONFIGURATION_PD_ENH, val);
