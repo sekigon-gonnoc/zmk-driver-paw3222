@@ -11,7 +11,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <errno.h>
 #include <zephyr/device.h>
+#include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/input/input.h>
@@ -19,7 +21,23 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/device_runtime.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/util.h>
+#include <zmk/event_manager.h>
+#if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+#include <zmk/endpoints.h>
+#include <zmk/events/endpoint_changed.h>
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_NEMU_LINK)
+#include <zmk/nemu_link/control.h>
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_DYNAMIC_SETTINGS)
+#include "settings_schema_generated.h"
+#include <zephyr/sys/byteorder.h>
+#include <zmk/dynamic_settings/store.h>
+#endif
 
 #include "../include/paw3222.h"
 
@@ -66,6 +84,7 @@ LOG_MODULE_REGISTER(paw32xx, CONFIG_ZMK_LOG_LEVEL);
 #define RES_STEP 38
 #define RES_MIN (16 * RES_STEP)
 #define RES_MAX (127 * RES_STEP)
+#define PAW32XX_FIXED_COMPENSATION_1MS_TICKS 2U
 
 struct paw32xx_config {
     struct spi_dt_spec spi;
@@ -73,14 +92,153 @@ struct paw32xx_config {
     struct gpio_dt_spec power_gpio;
     int16_t res_cpi;
     bool force_awake;
+    uint32_t poll_interval_us[3];
 };
 
 struct paw32xx_data {
     const struct device *dev;
+    struct k_mutex lock;
     struct k_work motion_work;
+    struct k_work route_work;
     struct gpio_callback motion_cb;
-    struct k_timer motion_timer; // Add timer for delayed motion checking
+    struct k_timer motion_timer;
+    uint32_t poll_interval_us[3];
+    bool fast_input_registered;
+    bool suspended;
+    atomic_t timer_expiration_tick;
+    atomic_t timer_expiration_sequence;
+    uint32_t last_timer_expiration_sequence;
+    uint32_t timer_dispatch_average_ticks;
 };
+
+static uint8_t paw32xx_poll_route(void) {
+#if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+#if IS_ENABLED(CONFIG_ZMK_NEMU_LINK)
+    return zmk_nemu_link_owns_radio() ? PAW32XX_POLL_ROUTE_ESB : PAW32XX_POLL_ROUTE_BLE;
+#else
+    return PAW32XX_POLL_ROUTE_BLE;
+#endif
+#else
+#if IS_ENABLED(CONFIG_ZMK_NEMU_LINK)
+    /* Sensor input may be routed through ESB while this device's local USB
+     * endpoint remains selected. The split-link route takes precedence over
+     * the endpoint used for locally generated reports. */
+    if (zmk_nemu_link_owns_radio()) {
+        return PAW32XX_POLL_ROUTE_ESB;
+    }
+#endif
+    if (zmk_endpoint_get_selected().transport == ZMK_TRANSPORT_USB) {
+        return PAW32XX_POLL_ROUTE_USB;
+    }
+    return PAW32XX_POLL_ROUTE_BLE;
+#endif
+}
+
+static int paw32xx_sync_fast_input(const struct device *dev) {
+    struct paw32xx_data *data = dev->data;
+#if IS_ENABLED(CONFIG_ZMK_NEMU_LINK)
+    k_mutex_lock(&data->lock, K_FOREVER);
+    bool desired = !data->suspended && paw32xx_poll_route() == PAW32XX_POLL_ROUTE_ESB &&
+                   data->poll_interval_us[PAW32XX_POLL_ROUTE_ESB] <= 2000U;
+    bool registered = data->fast_input_registered;
+    k_mutex_unlock(&data->lock);
+    if (desired == registered) {
+        return 0;
+    }
+
+    int err = zmk_nemu_link_fast_input_register(dev, desired);
+    if (!err) {
+        k_mutex_lock(&data->lock, K_FOREVER);
+        data->fast_input_registered = desired;
+        k_mutex_unlock(&data->lock);
+    }
+    return err;
+#else
+    ARG_UNUSED(data);
+    return 0;
+#endif
+}
+
+static void paw32xx_route_work_handler(struct k_work *work);
+
+#define PAW32XX_GET_DEVICE(node_id) DEVICE_DT_GET(node_id),
+static const struct device *paw32xx_devices[] = {
+    DT_FOREACH_STATUS_OKAY(DT_DRV_COMPAT, PAW32XX_GET_DEVICE)};
+
+static void paw32xx_schedule_route_updates(void) {
+    for (size_t i = 0; i < ARRAY_SIZE(paw32xx_devices); i++) {
+        const struct device *dev = paw32xx_devices[i];
+        if (device_is_ready(dev)) {
+            k_work_submit(&((struct paw32xx_data *)dev->data)->route_work);
+        }
+    }
+}
+
+#if IS_ENABLED(CONFIG_ZMK_NEMU_LINK)
+static bool paw32xx_mode_observer_registration_attempted;
+
+static void paw32xx_nemu_link_mode_changed(bool esb, int error) {
+    ARG_UNUSED(esb);
+    ARG_UNUSED(error);
+    paw32xx_schedule_route_updates();
+}
+
+static const struct zmk_nemu_link_observer paw32xx_nemu_link_observer = {
+    .mode_changed = paw32xx_nemu_link_mode_changed,
+};
+
+static int paw32xx_register_mode_observer(void) {
+    if (paw32xx_mode_observer_registration_attempted) {
+        return 0;
+    }
+    paw32xx_mode_observer_registration_attempted = true;
+
+    int err = zmk_nemu_link_register_observer(&paw32xx_nemu_link_observer);
+    if (err == -EALREADY) {
+        LOG_WRN("Nemu-link mode observer is already registered; route changes may "
+                "not be observed");
+        return 0;
+    }
+    if (err < 0) {
+        LOG_ERR("Failed to register Nemu-link mode observer: %d", err);
+    }
+    return err;
+}
+#endif
+
+#if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+static int paw32xx_endpoint_changed(const zmk_event_t *eh) {
+    if (!as_zmk_endpoint_changed(eh)) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    paw32xx_schedule_route_updates();
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(paw32xx_endpoint_changed, paw32xx_endpoint_changed);
+ZMK_SUBSCRIPTION(paw32xx_endpoint_changed, zmk_endpoint_changed);
+#endif
+
+static void paw32xx_route_work_handler(struct k_work *work) {
+    struct paw32xx_data *data = CONTAINER_OF(work, struct paw32xx_data, route_work);
+    const struct device *dev = data->dev;
+    int err = paw32xx_sync_fast_input(dev);
+    if (err) {
+        LOG_WRN("High-speed input registration failed: %d", err);
+    }
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    if (data->suspended) {
+        k_mutex_unlock(&data->lock);
+        return;
+    }
+    if (k_timer_remaining_get(&data->motion_timer) > 0) {
+        uint32_t interval_us = data->poll_interval_us[paw32xx_poll_route()];
+        k_timer_start(&data->motion_timer, K_USEC(interval_us), K_NO_WAIT);
+    }
+    k_mutex_unlock(&data->lock);
+}
 
 static int paw32xx_force_cs(const struct device *dev, bool force_low) {
     const struct paw32xx_config *cfg = dev->config;
@@ -105,7 +263,8 @@ static int paw32xx_force_cs(const struct device *dev, bool force_low) {
     return 0;
 }
 
-// Define a custom sign_extend function to avoid conflict with Zephyr's implementation
+// Define a custom sign_extend function to avoid conflict with Zephyr's
+// implementation
 static inline int32_t _sign_extend(uint32_t value, uint8_t index) {
     __ASSERT_NO_MSG(index <= 31);
 
@@ -246,43 +405,135 @@ static int paw32xx_interrupt_disable(const struct device *dev) {
 
 static void paw32xx_motion_timer_handler(struct k_timer *timer) {
     struct paw32xx_data *data = CONTAINER_OF(timer, struct paw32xx_data, motion_timer);
+    atomic_set(&data->timer_expiration_tick, (atomic_val_t)(uint32_t)k_uptime_ticks());
+    atomic_inc(&data->timer_expiration_sequence);
     k_work_submit(&data->motion_work);
+}
+
+static void paw32xx_schedule_next_poll_locked(struct paw32xx_data *data, int64_t work_start_ticks,
+                                              uint32_t interval_us) {
+    int64_t elapsed_ticks = k_uptime_ticks() - work_start_ticks;
+    int64_t interval_ticks = k_us_to_ticks_ceil64(interval_us);
+    uint32_t max_compensation = interval_ticks > 1 ? (uint32_t)(interval_ticks - 1) : 0;
+    uint32_t compensation_ticks = MIN(data->timer_dispatch_average_ticks, max_compensation);
+    if (interval_us == 1000) {
+        compensation_ticks = MIN(PAW32XX_FIXED_COMPENSATION_1MS_TICKS, max_compensation);
+    }
+    int64_t delay_ticks = interval_ticks - compensation_ticks - elapsed_ticks;
+    k_timer_start(&data->motion_timer, K_TICKS(delay_ticks > 1 ? delay_ticks : 1), K_NO_WAIT);
 }
 
 static void paw32xx_motion_work_handler(struct k_work *work) {
     struct paw32xx_data *data = CONTAINER_OF(work, struct paw32xx_data, motion_work);
     const struct device *dev = data->dev;
     const struct paw32xx_config *cfg = dev->config;
-    uint8_t val;
+    uint8_t status;
     int16_t x, y;
     int ret;
+    int64_t work_start_ticks;
 
-    ret = paw32xx_read_reg(dev, PAW32XX_MOTION, &val);
-    if (ret < 0) {
-        return;
+    k_mutex_lock(&data->lock, K_FOREVER);
+    work_start_ticks = k_uptime_ticks();
+    if (data->suspended) {
+        goto unlock;
     }
 
-    if ((val & MOTION_STATUS_MOTION) == 0x00) {
-        // No motion detected, re-enable interrupts and wait for next interrupt
-        paw32xx_interrupt_enable(dev);
-
-        if (gpio_pin_get_dt(&cfg->irq_gpio) == 0) {
-            return;
+    uint32_t timer_sequence_before = (uint32_t)atomic_get(&data->timer_expiration_sequence);
+    uint32_t timer_tick = (uint32_t)atomic_get(&data->timer_expiration_tick);
+    uint32_t timer_sequence_after = (uint32_t)atomic_get(&data->timer_expiration_sequence);
+    bool timer_triggered_work = timer_sequence_before == timer_sequence_after &&
+                                timer_sequence_after != data->last_timer_expiration_sequence;
+    if (timer_triggered_work) {
+        uint32_t dispatch_ticks = (uint32_t)work_start_ticks - timer_tick;
+        if (dispatch_ticks <= CONFIG_SYS_CLOCK_TICKS_PER_SEC) {
+            if (data->timer_dispatch_average_ticks == 0) {
+                data->timer_dispatch_average_ticks = dispatch_ticks;
+            } else {
+                data->timer_dispatch_average_ticks =
+                    (data->timer_dispatch_average_ticks * 3 + dispatch_ticks) / 4;
+            }
         }
+        data->last_timer_expiration_sequence = timer_sequence_after;
+    }
+
+    ret = paw32xx_read_reg(dev, PAW32XX_MOTION, &status);
+    if (ret < 0) {
+        LOG_ERR("Failed to read motion status: %d", ret);
+        goto unlock;
+    }
+
+    bool poll_again = (status & MOTION_STATUS_MOTION) != 0;
+    if (!poll_again) {
+        paw32xx_interrupt_enable(dev);
+        if (gpio_pin_get_dt(&cfg->irq_gpio) == 0) {
+            goto unlock;
+        }
+    } else {
+        uint8_t route = paw32xx_poll_route();
+        paw32xx_schedule_next_poll_locked(data, work_start_ticks, data->poll_interval_us[route]);
     }
 
     ret = paw32xx_read_xy(dev, &x, &y);
     if (ret < 0) {
+        LOG_ERR("Failed to read motion deltas: %d", ret);
+        goto unlock;
+    }
+
+    k_mutex_unlock(&data->lock);
+
+    int fast_input_err = paw32xx_sync_fast_input(dev);
+    if (fast_input_err) {
+        LOG_WRN("High-speed input registration failed: %d", fast_input_err);
+    }
+#if IS_ENABLED(CONFIG_ZMK_NEMU_LINK)
+    k_mutex_lock(&data->lock, K_FOREVER);
+    bool fast_input_enabled = data->fast_input_registered;
+    k_mutex_unlock(&data->lock);
+    if (!fast_input_err && fast_input_enabled) {
+        zmk_nemu_link_fast_input_activity(dev);
+    }
+#endif
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    if (data->suspended) {
+        k_mutex_unlock(&data->lock);
         return;
     }
 
-    LOG_DBG("x=%4d y=%4d", x, y);
+    int input_x_ret = input_report_rel(dev, INPUT_REL_X, x, false, K_FOREVER);
+    int input_y_ret = input_report_rel(dev, INPUT_REL_Y, y, true, K_FOREVER);
+    if (input_x_ret < 0 || input_y_ret < 0) {
+        LOG_ERR("Failed to report pointer movement: %d/%d", input_x_ret, input_y_ret);
+    }
 
-    input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
-    input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
+    k_mutex_unlock(&data->lock);
+    return;
 
-    // Schedule next check after 15ms without using interrupts
-    k_timer_start(&data->motion_timer, K_MSEC(15), K_NO_WAIT);
+unlock:
+    k_mutex_unlock(&data->lock);
+}
+
+int paw32xx_set_poll_interval_us(const struct device *dev, uint8_t route, uint32_t interval_us) {
+    if (!dev || route > PAW32XX_POLL_ROUTE_USB || interval_us < 500 || interval_us > 65535000) {
+        return -EINVAL;
+    }
+    struct paw32xx_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    data->poll_interval_us[route] = interval_us;
+    if (!data->suspended && k_timer_remaining_get(&data->motion_timer) > 0) {
+        uint32_t active_interval_us = data->poll_interval_us[paw32xx_poll_route()];
+        k_timer_start(&data->motion_timer, K_USEC(active_interval_us), K_NO_WAIT);
+    }
+    k_mutex_unlock(&data->lock);
+    return paw32xx_sync_fast_input(dev);
+}
+
+int paw32xx_set_poll_interval(const struct device *dev, uint8_t route, uint16_t interval_ms) {
+    if (interval_ms == 0) {
+        return -EINVAL;
+    }
+    return paw32xx_set_poll_interval_us(dev, route, (uint32_t)interval_ms * 1000U);
 }
 
 static void paw32xx_motion_handler(const struct device *gpio_dev, struct gpio_callback *cb,
@@ -293,17 +544,13 @@ static void paw32xx_motion_handler(const struct device *gpio_dev, struct gpio_ca
     ARG_UNUSED(gpio_dev);
     ARG_UNUSED(pins);
 
-    // Disable interrupts while timer is active
     paw32xx_interrupt_disable(dev);
-
-    // Cancel any pending timer
     k_timer_stop(&data->motion_timer);
-
-    // Process motion
     k_work_submit(&data->motion_work);
 }
 
 int paw32xx_set_resolution(const struct device *dev, uint16_t res_cpi) {
+    struct paw32xx_data *data = dev->data;
     uint8_t val;
     int ret;
 
@@ -312,32 +559,36 @@ int paw32xx_set_resolution(const struct device *dev, uint16_t res_cpi) {
         return -EINVAL;
     }
 
+    k_mutex_lock(&data->lock, K_FOREVER);
+
     val = res_cpi / RES_STEP;
 
     ret = paw32xx_write_reg(dev, PAW32XX_WRITE_PROTECT, WRITE_PROTECT_DISABLE);
     if (ret < 0) {
-        return ret;
+        goto unlock;
     }
 
     ret = paw32xx_write_reg(dev, PAW32XX_CPI_X, val);
     if (ret < 0) {
-        return ret;
+        goto unlock;
     }
 
     ret = paw32xx_write_reg(dev, PAW32XX_CPI_Y, val);
     if (ret < 0) {
-        return ret;
+        goto unlock;
     }
 
     ret = paw32xx_write_reg(dev, PAW32XX_WRITE_PROTECT, WRITE_PROTECT_ENABLE);
     if (ret < 0) {
-        return ret;
+        goto unlock;
     }
 
-    return 0;
+unlock:
+    k_mutex_unlock(&data->lock);
+    return ret;
 }
 
-int paw32xx_force_awake(const struct device *dev, bool enable) {
+static int paw32xx_force_awake_locked(const struct device *dev, bool enable) {
     uint8_t val = enable ? 0 : OPERATION_MODE_SLP_MASK;
     int ret;
 
@@ -352,11 +603,16 @@ int paw32xx_force_awake(const struct device *dev, bool enable) {
     }
 
     ret = paw32xx_write_reg(dev, PAW32XX_WRITE_PROTECT, WRITE_PROTECT_ENABLE);
-    if (ret < 0) {
-        return ret;
-    }
+    return ret;
+}
 
-    return 0;
+int paw32xx_force_awake(const struct device *dev, bool enable) {
+    struct paw32xx_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    int ret = paw32xx_force_awake_locked(dev, enable);
+    k_mutex_unlock(&data->lock);
+    return ret;
 }
 
 static int paw32xx_configure(const struct device *dev) {
@@ -400,8 +656,7 @@ static int paw32xx_configure(const struct device *dev) {
 #endif
             k_sleep(K_MSEC(100)); // Wait before retrying
             continue;
-        }
-        else {
+        } else {
             break; // Device is ready
         }
     }
@@ -439,8 +694,11 @@ static int paw32xx_init(const struct device *dev) {
     }
 
     data->dev = dev;
+    k_mutex_init(&data->lock);
+    memcpy(data->poll_interval_us, cfg->poll_interval_us, sizeof(data->poll_interval_us));
 
     k_work_init(&data->motion_work, paw32xx_motion_work_handler);
+    k_work_init(&data->route_work, paw32xx_route_work_handler);
     // Initialize the timer for delayed motion checks
     k_timer_init(&data->motion_timer, paw32xx_motion_timer_handler, NULL);
 
@@ -507,6 +765,48 @@ static int paw32xx_init(const struct device *dev) {
         return ret;
     }
 
+#if IS_ENABLED(CONFIG_ZMK_DYNAMIC_SETTINGS)
+    uint32_t cpi_setting_id = 0;
+#ifdef DYNAMIC_SETTING_ID_POINTER_SENSOR_CPI_LEFT
+    const struct dynamic_setting_group_descriptor *left_cpi_group =
+        dynamic_settings_find_setting_group(DYNAMIC_SETTING_ID_POINTER_SENSOR_CPI_LEFT);
+    if (left_cpi_group && left_cpi_group->context == dev) {
+        cpi_setting_id = DYNAMIC_SETTING_ID_POINTER_SENSOR_CPI_LEFT;
+    }
+#endif
+#ifdef DYNAMIC_SETTING_ID_POINTER_SENSOR_CPI_RIGHT
+    const struct dynamic_setting_group_descriptor *right_cpi_group =
+        dynamic_settings_find_setting_group(DYNAMIC_SETTING_ID_POINTER_SENSOR_CPI_RIGHT);
+    if (right_cpi_group && right_cpi_group->context == dev) {
+        cpi_setting_id = DYNAMIC_SETTING_ID_POINTER_SENSOR_CPI_RIGHT;
+    }
+#endif
+    if (cpi_setting_id != 0U) {
+        struct dynamic_setting_value initial_cpi;
+        ret = dynamic_settings_read(cpi_setting_id, &initial_cpi, NULL);
+        if (ret != 0) {
+            LOG_ERR("Failed to read initial dynamic CPI setting: %d", ret);
+            return ret;
+        }
+        if (initial_cpi.type != DYNAMIC_SETTING_TYPE_U16 ||
+            initial_cpi.length != sizeof(uint16_t)) {
+            LOG_ERR("Invalid initial dynamic CPI setting");
+            return -EINVAL;
+        }
+        ret = paw32xx_set_resolution(dev, sys_get_le16(initial_cpi.data));
+        if (ret != 0) {
+            LOG_ERR("Failed to apply initial dynamic CPI setting: %d", ret);
+            return ret;
+        }
+    }
+
+    ret = dynamic_settings_apply_init_required(dev);
+    if (ret != 0) {
+        LOG_ERR("Failed to apply init-only settings: %d", ret);
+        return ret;
+    }
+#endif
+
     ret = paw32xx_interrupt_enable(dev);
     if (ret != 0) {
         LOG_ERR("Motion interrupt configuration failed: %d", ret);
@@ -519,22 +819,49 @@ static int paw32xx_init(const struct device *dev) {
         return ret;
     }
 
+#if IS_ENABLED(CONFIG_ZMK_NEMU_LINK)
+    ret = paw32xx_register_mode_observer();
+    if (ret < 0) {
+        return ret;
+    }
+    ret = paw32xx_sync_fast_input(dev);
+    if (ret < 0) {
+        LOG_ERR("Failed to synchronize Nemu-link fast input state: %d", ret);
+    }
+#endif
+
     return 0;
 }
 
 #ifdef CONFIG_PM_DEVICE
 static int paw32xx_pm_action(const struct device *dev, enum pm_device_action action) {
     const struct paw32xx_config *cfg = dev->config;
+    struct paw32xx_data *data = dev->data;
     int ret;
     uint8_t val;
 
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
-        // Disable IRQ interrupt
+        k_mutex_lock(&data->lock, K_FOREVER);
+        if (data->suspended) {
+            k_mutex_unlock(&data->lock);
+            return 0;
+        }
+        data->suspended = true;
+        k_timer_stop(&data->motion_timer);
         ret = paw32xx_interrupt_disable(dev);
+        k_mutex_unlock(&data->lock);
         if (ret < 0) {
             LOG_ERR("Failed to disable IRQ interrupt: %d", ret);
             return ret;
+        }
+
+        struct k_work_sync work_sync;
+        k_work_cancel_sync(&data->motion_work, &work_sync);
+        k_work_cancel_sync(&data->route_work, &work_sync);
+        ret = paw32xx_sync_fast_input(dev);
+        if (ret < 0) {
+            LOG_ERR("Failed to unregister high-speed input during suspend: %d", ret);
         }
 
         // Disconnect IRQ GPIO
@@ -545,7 +872,9 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         }
 
         val = CONFIGURATION_PD_ENH;
+        k_mutex_lock(&data->lock, K_FOREVER);
         ret = paw32xx_update_reg(dev, PAW32XX_CONFIGURATION, CONFIGURATION_PD_ENH, val);
+        k_mutex_unlock(&data->lock);
         if (ret < 0) {
             return ret;
         }
@@ -553,6 +882,12 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         break;
 
     case PM_DEVICE_ACTION_RESUME:
+        k_mutex_lock(&data->lock, K_FOREVER);
+        if (!data->suspended) {
+            k_mutex_unlock(&data->lock);
+            return 0;
+        }
+        k_mutex_unlock(&data->lock);
 
         val = 0;
         ret = paw32xx_update_reg(dev, PAW32XX_CONFIGURATION, CONFIGURATION_PD_ENH, val);
@@ -567,11 +902,18 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
             return ret;
         }
 
-        // Re-enable IRQ interrupt
+        k_mutex_lock(&data->lock, K_FOREVER);
+        data->suspended = false;
         ret = paw32xx_interrupt_enable(dev);
+        k_mutex_unlock(&data->lock);
         if (ret < 0) {
             LOG_ERR("Failed to enable IRQ interrupt: %d", ret);
             return ret;
+        }
+
+        ret = paw32xx_sync_fast_input(dev);
+        if (ret < 0) {
+            LOG_ERR("Failed to register high-speed input during resume: %d", ret);
         }
         break;
 
@@ -589,6 +931,9 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
 #define PAW32XX_INIT(n)                                                                            \
     BUILD_ASSERT(IN_RANGE(DT_INST_PROP_OR(n, res_cpi, RES_MIN), RES_MIN, RES_MAX),                 \
                  "invalid res-cpi");                                                               \
+    BUILD_ASSERT(DT_INST_PROP_OR(n, poll_interval_esb_ms, 1) > 0,                                  \
+                 "poll-interval-esb-ms must be at least 1");                                       \
+    BUILD_ASSERT(PAW32XX_ESB_FAST_POLL_LEAD_US < 1000U, "ESB poll lead must not underflow 1 ms");  \
                                                                                                    \
     static const struct paw32xx_config paw32xx_cfg_##n = {                                         \
         .spi = SPI_DT_SPEC_INST_GET(n, PAW32XX_SPI_MODE, 0),                                       \
@@ -596,6 +941,12 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         .power_gpio = GPIO_DT_SPEC_INST_GET_OR(n, power_gpios, {0}),                               \
         .res_cpi = DT_INST_PROP_OR(n, res_cpi, -1),                                                \
         .force_awake = DT_INST_PROP(n, force_awake),                                               \
+        .poll_interval_us = {((uint32_t)DT_INST_PROP_OR(n, poll_interval_esb_ms, 1) * 1000U -      \
+                              (DT_INST_PROP_OR(n, poll_interval_esb_ms, 1) <= 2                    \
+                                   ? PAW32XX_ESB_FAST_POLL_LEAD_US                                 \
+                                   : 0U)),                                                         \
+                             DT_INST_PROP_OR(n, poll_interval_ble_ms, 15) * 1000U,                 \
+                             DT_INST_PROP_OR(n, poll_interval_usb_ms, 1) * 1000U},                 \
     };                                                                                             \
                                                                                                    \
     static struct paw32xx_data paw32xx_data_##n;                                                   \

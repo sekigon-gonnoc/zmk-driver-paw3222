@@ -1,0 +1,82 @@
+#define PAW3222_STRINGIFY_INNER(_value) #_value
+#define PAW3222_STRINGIFY(_value) PAW3222_STRINGIFY_INNER(_value)
+#define PAW3222_CONCAT_INNER(_left, _right) _left##_right
+#define PAW3222_CONCAT(_left, _right) PAW3222_CONCAT_INNER(_left, _right)
+#define PAW3222_TARGET_ROLE_left "keyboard-left"
+#define PAW3222_TARGET_ROLE_right "keyboard-right"
+
+#define PAW3222_DYNAMIC_SETTINGS_GROUP(_node, _side, _device)                                 \
+    _node: _node {                                                                              \
+        compatible = "sekigon,dynamic-settings-group";                                         \
+        module-name = "pointer";                                                               \
+        group-name = "sensor";                                                                 \
+        instance-name = PAW3222_STRINGIFY(_side);                                               \
+        label = "Trackball Sensor";                                                            \
+        scope = "owner";                                                                        \
+        format-version = <1>;                                                                   \
+        target-role = PAW3222_CONCAT(PAW3222_TARGET_ROLE_, _side);                             \
+        actual-device = <&_device>;                                                             \
+        esb_interval {                                                                          \
+            compatible = "sekigon,dynamic-setting";                                            \
+            setting-name = "poll-interval-esb-ms";                                             \
+            label = "ESB sensor interval";                                                     \
+            help = "Values 1 and 2 ms enable fast input mode; current consumption may increase.";  \
+            value-type = "u8";                                                                 \
+            default-property = "poll-interval-esb-ms";                                         \
+            minimum = <1>;                                                                      \
+            maximum = <64>;                                                                     \
+            step = <1>;                                                                          \
+            unit = "ms";                                                                        \
+            widget = "number";                                                                 \
+            ui-subgroup = "Trackball";                                                         \
+            persistent;                                                                         \
+            on-change = "paw3222_dynamic_esb_interval_changed";                                \
+        };                                                                                      \
+        ble_interval {                                                                          \
+            compatible = "sekigon,dynamic-setting";                                            \
+            setting-name = "poll-interval-ble-ms";                                              \
+            label = "BLE polling interval";                                                    \
+            help = "PAW3222 read interval while BLE split is the active route.";               \
+            value-type = "u8";                                                                 \
+            default-property = "poll-interval-ble-ms";                                          \
+            minimum = <7>;                                                                      \
+            maximum = <64>;                                                                     \
+            step = <1>;                                                                          \
+            unit = "ms";                                                                        \
+            widget = "number";                                                                 \
+            ui-subgroup = "Trackball";                                                         \
+            persistent;                                                                         \
+            on-change = "paw3222_dynamic_ble_interval_changed";                               \
+        };                                                                                      \
+        usb_interval {                                                                          \
+            compatible = "sekigon,dynamic-setting";                                            \
+            setting-name = "poll-interval-usb-ms";                                              \
+            label = "USB polling interval";                                                    \
+            help = "PAW3222 read interval for a direct USB route.";                            \
+            value-type = "u8";                                                                 \
+            default-property = "poll-interval-usb-ms";                                          \
+            minimum = <1>;                                                                      \
+            maximum = <64>;                                                                     \
+            step = <1>;                                                                          \
+            unit = "ms";                                                                        \
+            widget = "number";                                                                 \
+            ui-subgroup = "Trackball";                                                         \
+            persistent;                                                                         \
+            on-change = "paw3222_dynamic_usb_interval_changed";                               \
+        };                                                                                      \
+        cpi {                                                                                   \
+            compatible = "sekigon,dynamic-setting";                                            \
+            setting-name = "cpi";                                                              \
+            label = "CPI";                                                                     \
+            value-type = "u16";                                                                \
+            default-int = <646>;                                                                \
+            minimum = <608>;                                                                    \
+            maximum = <4826>;                                                                   \
+            step = <38>;                                                                        \
+            unit = "CPI";                                                                       \
+            widget = "slider";                                                                 \
+            ui-subgroup = "Trackball";                                                         \
+            persistent;                                                                         \
+            on-change = "paw3222_dynamic_cpi_changed";                                         \
+        };                                                                                      \
+    }
