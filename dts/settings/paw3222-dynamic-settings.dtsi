@@ -19,7 +19,7 @@
         esb_interval {                                                                          \
             compatible = "sekigon,dynamic-setting";                                            \
             setting-name = "poll-interval-esb-ms";                                             \
-            label = "ESB sensor interval";                                                     \
+            label = "ESB polling interval";                                                     \
             help = "Values 1 and 2 ms enable fast input mode; current consumption may increase.";  \
             value-type = "u8";                                                                 \
             default-property = "poll-interval-esb-ms";                                         \
