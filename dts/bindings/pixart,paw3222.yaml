@@ -33,3 +33,18 @@ properties:
       Initialize the sensor in "force awake" mode. This can also be enabled or
       disabled in runtime by the application using the paw32xx_force_awake()
       API.
+
+  poll-interval-esb-ms:
+    type: int
+    default: 1
+    description: Polling interval in milliseconds for Nemu-link ESB output. Must be at least 1.
+
+  poll-interval-ble-ms:
+    type: int
+    default: 15
+    description: Polling interval in milliseconds for BLE split output.
+
+  poll-interval-usb-ms:
+    type: int
+    default: 1
+    description: Polling interval in milliseconds for direct USB output.
